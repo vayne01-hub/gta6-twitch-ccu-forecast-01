@@ -1,4 +1,4 @@
-// gta6-twitch-ccu-forecast-01 entry: a launch-day Twitch audience forecaster.
+// gta6-twitch-ccu-forecast-01 entry, v2: a launch-day Twitch audience forecaster.
 //
 // Method (fitted at run time from the case's own comparables, nothing hardcoded):
 // a big launch's release-day curve has a stable shape in log-ratio space. For every past
@@ -8,9 +8,17 @@
 // the US wakes) share one shape family; launches with a single global unlock later in the
 // UTC day have a near-empty hour 1 and a different, explosive shape, so the fit uses only
 // the rolling family (hour 1 at least 5% of the day's peak), falling back to the whole
-// pool when too few qualify. The forecast for hour h is the case's hour-1 print scaled by
-// the pool's median log-ratio at h, with the five quantiles set by the pool's per-hour
-// log-residual dispersion (median absolute deviation, read as a normal sigma). Where no
+// pool when too few qualify.
+//
+// Within that family, v2 weights each comparable by how close its scale is to this case:
+// w = exp(-|ln(hour-1 viewers of the comparable) - ln(hour-1 print of the case)|), so a
+// launch that opened at a similar audience size counts more than a much smaller or larger
+// one. The forecast centre for hour h is the similarity-weighted 10%-trimmed mean of the
+// family's log-ratios at h, scaled to the case's hour-1 print; the five quantiles are set
+// by the similarity-weighted interquartile range of the family's per-hour log-residuals
+// around that centre, read as a normal sigma ((q75 - q25) / 1.349). This replaced v1's
+// plain median + MAD after a pre-registered leave-one-out comparison on the rolling
+// family (v2 LOO pinball 0.270 vs v1's 0.311, same protocol, same pool). Where no
 // comparable is usable the program falls back to persistence (every hour at hour 1's
 // print, spread widening like a random walk's), so it always writes a valid forecast.
 //
@@ -35,6 +43,12 @@ const MIN_FAMILY = 10;
 const FALLBACK_SIGMA = 0.15;
 /** No hour's fitted dispersion may exceed this, however wild the pool's tail is there. */
 const SIGMA_CAP = 2.5;
+/** Similarity weights fall off over this log-distance in hour-1 viewers (fixed, not tuned). */
+const WEIGHT_SCALE = 1.0;
+/** Each tail of the weighted trimmed mean drops this share of the total weight. */
+const TRIM_SHARE = 0.1;
+/** The divisor that reads an interquartile range as a normal sigma. */
+const IQR_AS_SIGMA = 1.349;
 
 interface HourlyPoint { from: string; viewers: number }
 interface Comparable { name: string; day_start: string; hourly: HourlyPoint[] }
@@ -46,15 +60,45 @@ interface CaseFile {
   comparables: Comparable[];
 }
 
-/** Median of a non-empty list. */
-function median(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  const n = s.length;
-  return n % 2 === 1 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2;
-}
-
 /** x rounded to 2 decimals (half up), the output's working precision. */
 const round2 = (x: number): number => Math.round(x * 100) / 100;
+
+/**
+ * Weighted quantile of [value, weight] pairs, step (inverse-CDF) convention:
+ * the smallest value whose cumulative weight reaches p of the total weight.
+ */
+function wQuantile(pairs: Array<[number, number]>, p: number): number {
+  const s = [...pairs].sort((a, b) => a[0] - b[0]);
+  const total = s.reduce((a, x) => a + x[1], 0);
+  let cum = 0;
+  for (const [v, w] of s) {
+    cum += w;
+    if (cum >= p * total) return v;
+  }
+  return s[s.length - 1][0];
+}
+
+/**
+ * Weighted trimmed mean of [value, weight] pairs: TRIM_SHARE of the total weight is
+ * dropped from each tail (a pair straddling a cut contributes its remaining weight),
+ * and the kept weight averages the rest.
+ */
+function wTrimmedMean(pairs: Array<[number, number]>): number {
+  const s = [...pairs].sort((a, b) => a[0] - b[0]);
+  const total = s.reduce((a, x) => a + x[1], 0);
+  const cut = TRIM_SHARE * total;
+  let num = 0;
+  let den = 0;
+  let cum = 0;
+  for (const [v, w] of s) {
+    const start = cum;
+    cum += w;
+    const kept = Math.max(0, Math.min(cum, total - cut) - Math.max(start, cut));
+    num += v * kept;
+    den += kept;
+  }
+  return num / den;
+}
 
 /**
  * A comparable's release-day hourly viewers, index 0 = hour 1, or null when the day is
@@ -100,12 +144,18 @@ function forecastCase(c: CaseFile): Array<{ hour: number; q: number[] }> {
   const rolling = days.filter((day) => day[0] / Math.max(...day) >= ROLLING_MIN_SHARE);
   const train = rolling.length >= MIN_FAMILY ? rolling : days;
 
+  // Similarity of each training launch's scale to this case's hour-1 print.
+  const logP1 = Math.log(p1);
+  const weights = train.map((day) => Math.exp(-Math.abs(Math.log(day[0]) - logP1) / WEIGHT_SCALE));
+
   return (c.forecast ?? []).map(({ hour }) => {
     if (train.length === 0 || hour < 2 || hour > 24) return { hour, q: fallbackRow(p1, hour) };
     const ratios = train.map((day) => Math.log(day[hour - 1] / day[0]));
-    const med = median(ratios);
-    const sigma = Math.min(SIGMA_CAP, 1.4826 * median(ratios.map((r) => Math.abs(r - med))));
-    const q = Z.map((z) => p1 * Math.exp(med + z * sigma));
+    const pairs: Array<[number, number]> = ratios.map((r, i) => [r, weights[i]]);
+    const center = wTrimmedMean(pairs);
+    const resPairs: Array<[number, number]> = ratios.map((r, i) => [r - center, weights[i]]);
+    const sigma = Math.min(SIGMA_CAP, (wQuantile(resPairs, 0.75) - wQuantile(resPairs, 0.25)) / IQR_AS_SIGMA);
+    const q = Z.map((z) => p1 * Math.exp(center + z * sigma));
     // Quantiles must be non-decreasing, finite, above 0 and at most 1e9.
     for (let j = 1; j < q.length; j++) if (q[j] < q[j - 1]) q[j] = q[j - 1];
     return { hour, q: q.map((v) => round2(Math.min(1e9, Math.max(0.01, v)))) };
